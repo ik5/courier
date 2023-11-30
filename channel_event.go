@@ -11,10 +11,12 @@ type ChannelEventType string
 
 // Possible values for ChannelEventTypes
 const (
-	NewConversation ChannelEventType = "new_conversation"
-	Referral        ChannelEventType = "referral"
-	StopContact     ChannelEventType = "stop_contact"
-	WelcomeMessage  ChannelEventType = "welcome_message"
+	EventTypeNewConversation ChannelEventType = "new_conversation"
+	EventTypeReferral        ChannelEventType = "referral"
+	EventTypeStopContact     ChannelEventType = "stop_contact"
+	EventTypeWelcomeMessage  ChannelEventType = "welcome_message"
+	EventTypeOptIn           ChannelEventType = "optin"
+	EventTypeOptOut          ChannelEventType = "optout"
 )
 
 //-----------------------------------------------------------------------------
@@ -23,19 +25,17 @@ const (
 
 // ChannelEvent represents an event on a channel, such as a follow, new conversation or referral
 type ChannelEvent interface {
+	Event
+
 	ChannelUUID() ChannelUUID
 	URN() urns.URN
 	EventType() ChannelEventType
-	Extra() map[string]interface{}
+	Extra() map[string]string
 	CreatedOn() time.Time
 	OccurredOn() time.Time
 
-	Logs() []*ChannelLog
-	AddLog(log *ChannelLog)
-
 	WithContactName(name string) ChannelEvent
-	WithExtra(extra map[string]interface{}) ChannelEvent
+	WithURNAuthTokens(tokens map[string]string) ChannelEvent
+	WithExtra(extra map[string]string) ChannelEvent
 	WithOccurredOn(time.Time) ChannelEvent
-
-	EventID() int64
 }

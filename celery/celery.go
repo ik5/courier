@@ -4,9 +4,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 
-	"github.com/nyaruka/courier/utils"
+	"github.com/nyaruka/gocommon/uuids"
 
-	"github.com/garyburd/redigo/redis"
+	"github.com/gomodule/redigo/redis"
 )
 
 // allows queuing a task to celery (with a redis backend)
@@ -39,12 +39,12 @@ const defaultBody = `[[], {}, {"chord": null, "callbacks": null, "errbacks": nul
 // QueueEmptyTask queues a new empty task with the passed in task name for the passed in queue
 func QueueEmptyTask(rc redis.Conn, queueName string, taskName string) error {
 	body := base64.StdEncoding.EncodeToString([]byte(defaultBody))
-	taskUUID := utils.NewUUID()
-	deliveryTag := utils.NewUUID()
+	taskUUID := string(uuids.New())
+	deliveryTag := string(uuids.New())
 
 	task := Task{
 		Body: body,
-		Headers: map[string]interface{}{
+		Headers: map[string]any{
 			"root_id":    taskUUID,
 			"id":         taskUUID,
 			"lang":       "py",
@@ -63,7 +63,7 @@ func QueueEmptyTask(rc redis.Conn, queueName string, taskName string) error {
 		Properties: TaskProperties{
 			BodyEncoding:  "base64",
 			CorrelationID: taskUUID,
-			ReplyTo:       utils.NewUUID(),
+			ReplyTo:       string(uuids.New()),
 			DeliveryMode:  2,
 			DeliveryTag:   deliveryTag,
 			DeliveryInfo: TaskDeliveryInfo{
@@ -84,11 +84,11 @@ func QueueEmptyTask(rc redis.Conn, queueName string, taskName string) error {
 
 // Task is the outer struct for a celery task
 type Task struct {
-	Body            string                 `json:"body"`
-	Headers         map[string]interface{} `json:"headers"`
-	ContentType     string                 `json:"content-type"`
-	Properties      TaskProperties         `json:"properties"`
-	ContentEncoding string                 `json:"content-encoding"`
+	Body            string         `json:"body"`
+	Headers         map[string]any `json:"headers"`
+	ContentType     string         `json:"content-type"`
+	Properties      TaskProperties `json:"properties"`
+	ContentEncoding string         `json:"content-encoding"`
 }
 
 // TaskProperties is the struct for a task's properties

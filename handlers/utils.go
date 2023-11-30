@@ -13,8 +13,12 @@ import (
 	"github.com/nyaruka/gocommon/urns"
 )
 
+var (
+	urlRegex = regexp.MustCompile(`https?:\/\/(www\.)?[^\W][-a-zA-Z0-9@:%.\+~#=]{1,256}[^\W]\.[a-zA-Z()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*)`)
+)
+
 // GetTextAndAttachments returns both the text of our message as well as any attachments, newline delimited
-func GetTextAndAttachments(m courier.Msg) string {
+func GetTextAndAttachments(m courier.MsgOut) string {
 	buf := bytes.NewBuffer([]byte(m.Text()))
 	for _, a := range m.Attachments() {
 		_, url := SplitAttachment(a)
@@ -52,10 +56,10 @@ var base64Regex, _ = regexp.Compile("^([a-zA-Z0-9+/=]{4})+$")
 var base64Encoding = base64.StdEncoding.Strict()
 
 // DecodePossibleBase64 detects and decodes a possibly base64 encoded messages by doing:
-//  * check it's at least 60 characters
-//  * check its length is divisible by 4
-//  * check that there's no whitespace
-//  * check the decoded string contains at least 50% ascii
+//   - check it's at least 60 characters
+//   - check its length is divisible by 4
+//   - check that there's no whitespace
+//   - check the decoded string contains at least 50% ascii
 func DecodePossibleBase64(original string) string {
 	stripped := strings.TrimSpace(strings.Replace(strings.Replace(original, "\r", "", -1), "\n", "", -1))
 	length := len([]rune(stripped))
@@ -88,29 +92,6 @@ func DecodePossibleBase64(original string) string {
 	return decoded
 }
 
-// SplitMsg splits the passed in string into segments that are at most max length
-func SplitMsg(text string, max int) []string {
-	// smaller than our max, just return it
-	if len(text) <= max {
-		return []string{text}
-	}
-
-	parts := make([]string, 0, 2)
-	part := bytes.Buffer{}
-	for _, r := range text {
-		part.WriteRune(r)
-		if part.Len() == max || (part.Len() > max-6 && r == ' ') {
-			parts = append(parts, strings.TrimSpace(part.String()))
-			part.Reset()
-		}
-	}
-	if part.Len() > 0 {
-		parts = append(parts, strings.TrimSpace(part.String()))
-	}
-
-	return parts
-}
-
 // StrictTelForCountry wraps urns.NewURNTelForCountry but is stricter in
 // what it accepts. Incoming tels must be numeric or we will return an
 // error. (IE, alphanumeric shortcodes are not ok)
@@ -135,4 +116,8 @@ func StrictTelForCountry(number string, country string) (urns.URN, error) {
 	}
 
 	return urn, nil
+}
+
+func IsURL(s string) bool {
+	return urlRegex.MatchString(s)
 }

@@ -4,13 +4,14 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
-
-	"github.com/nyaruka/null"
+	"log/slog"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/nyaruka/courier"
+	"github.com/nyaruka/courier/utils"
 	"github.com/nyaruka/gocommon/urns"
-	"github.com/sirupsen/logrus"
+	"github.com/nyaruka/null/v3"
+	"github.com/pkg/errors"
 )
 
 // ContactURNID represents a contact urn's id
@@ -19,78 +20,72 @@ type ContactURNID null.Int
 // NilContactURNID is our constant for a nil contact URN id
 const NilContactURNID = ContactURNID(0)
 
-// MarshalJSON marshals into JSON. 0 values will become null
-func (i ContactURNID) MarshalJSON() ([]byte, error) {
-	return null.Int(i).MarshalJSON()
+func (i *ContactURNID) Scan(value any) error         { return null.ScanInt(value, i) }
+func (i ContactURNID) Value() (driver.Value, error)  { return null.IntValue(i) }
+func (i *ContactURNID) UnmarshalJSON(b []byte) error { return null.UnmarshalInt(b, i) }
+func (i ContactURNID) MarshalJSON() ([]byte, error)  { return null.MarshalInt(i) }
+
+// ContactURN is our struct to map to database level URNs
+type ContactURN struct {
+	ID            ContactURNID      `db:"id"`
+	OrgID         OrgID             `db:"org_id"`
+	ContactID     ContactID         `db:"contact_id"`
+	Identity      string            `db:"identity"`
+	Scheme        string            `db:"scheme"`
+	Path          string            `db:"path"`
+	Display       null.String       `db:"display"`
+	AuthTokens    null.Map[string]  `db:"auth_tokens"`
+	Priority      int               `db:"priority"`
+	ChannelID     courier.ChannelID `db:"channel_id"`
+	PrevContactID ContactID
 }
 
-// UnmarshalJSON unmarshals from JSON. null values become 0
-func (i *ContactURNID) UnmarshalJSON(b []byte) error {
-	return null.UnmarshalInt(b, (*null.Int)(i))
-}
-
-// Value returns the db value, null is returned for 0
-func (i ContactURNID) Value() (driver.Value, error) {
-	return null.Int(i).Value()
-}
-
-// Scan scans from the db value. null values become 0
-func (i *ContactURNID) Scan(value interface{}) error {
-	return null.ScanInt(value, (*null.Int)(i))
-}
-
-// NewDBContactURN returns a new ContactURN object for the passed in org, contact and string urn, this is not saved to the DB yet
-func newDBContactURN(org OrgID, channelID courier.ChannelID, contactID ContactID, urn urns.URN, auth string) *DBContactURN {
-	return &DBContactURN{
-		OrgID:     org,
-		ChannelID: channelID,
-		ContactID: contactID,
-		Identity:  string(urn.Identity()),
-		Scheme:    urn.Scheme(),
-		Path:      urn.Path(),
-		Display:   null.String(urn.Display()),
-		Auth:      null.String(auth),
+// returns a new ContactURN object for the passed in org, contact and string URN
+func newContactURN(org OrgID, channelID courier.ChannelID, contactID ContactID, urn urns.URN, authTokens map[string]string) *ContactURN {
+	return &ContactURN{
+		OrgID:      org,
+		ChannelID:  channelID,
+		ContactID:  contactID,
+		Identity:   string(urn.Identity()),
+		Scheme:     urn.Scheme(),
+		Path:       urn.Path(),
+		Display:    null.String(urn.Display()),
+		AuthTokens: null.Map[string](authTokens),
 	}
 }
 
-const selectContactURNs = `
-SELECT 
-	id, 
-	identity, 
-	scheme, 
-	display, 
-	auth, 
-	priority, 
-	contact_id, 
-	channel_id
-FROM 
-	contacts_contacturn
-WHERE 
-	contact_id = $1
-ORDER BY 
-	priority desc
-`
+const sqlSelectURNsByContact = `
+  SELECT id, org_id, contact_id, identity, scheme, path, display, auth_tokens, priority, channel_id
+    FROM contacts_contacturn
+   WHERE contact_id = $1
+ORDER BY priority DESC`
 
-// selectContactURNs returns all the ContactURNs for the passed in contact, sorted by priority
-func contactURNsForContact(db *sqlx.Tx, contactID ContactID) ([]*DBContactURN, error) {
+const sqlSelectURNByIdentity = `
+  SELECT id, org_id, contact_id, identity, scheme, path, display, auth_tokens, priority, channel_id
+    FROM contacts_contacturn
+   WHERE org_id = $1 AND identity = $2
+ORDER BY priority DESC 
+   LIMIT 1`
+
+// returns all the ContactURNs for the passed in contact, sorted by priority
+func getURNsForContact(db *sqlx.Tx, contactID ContactID) ([]*ContactURN, error) {
 	// select all the URNs for this contact
-	rows, err := db.Queryx(selectContactURNs, contactID)
+	rows, err := db.Queryx(sqlSelectURNsByContact, contactID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	// read our URNs out
-	urns := make([]*DBContactURN, 0, 3)
-	idx := 0
+	urns := make([]*ContactURN, 0, 3)
+
 	for rows.Next() {
-		u := &DBContactURN{}
-		err = rows.StructScan(u)
-		if err != nil {
+		u := &ContactURN{}
+
+		if err := rows.StructScan(u); err != nil {
 			return nil, err
 		}
+
 		urns = append(urns, u)
-		idx++
 	}
 	return urns, nil
 }
@@ -99,11 +94,11 @@ func contactURNsForContact(db *sqlx.Tx, contactID ContactID) ([]*DBContactURN, e
 // that the passed in channel is the default one for that URN
 //
 // Note that the URN must be one of the contact's URN before calling this method
-func setDefaultURN(db *sqlx.Tx, channelID courier.ChannelID, contact *DBContact, urn urns.URN, auth string) error {
+func setDefaultURN(db *sqlx.Tx, channel *Channel, contact *Contact, urn urns.URN, authTokens map[string]string) error {
 	scheme := urn.Scheme()
-	contactURNs, err := contactURNsForContact(db, contact.ID_)
+	contactURNs, err := getURNsForContact(db, contact.ID_)
 	if err != nil {
-		logrus.WithError(err).WithField("urn", urn.Identity()).WithField("channel_id", channelID).Error("error looking up contact urns")
+		slog.Error("error looking up contact urns", "error", err, "urn", urn.Identity(), "channel_id", channel.ID())
 		return err
 	}
 
@@ -116,13 +111,16 @@ func setDefaultURN(db *sqlx.Tx, channelID courier.ChannelID, contact *DBContact,
 	if contactURNs[0].Identity == string(urn.Identity()) {
 		display := urn.Display()
 
-		// if display, channel id or auth changed, update them
-		if string(contactURNs[0].Display) != display || contactURNs[0].ChannelID != channelID || (auth != "" && string(contactURNs[0].Auth) != auth) {
+		// if display, channel id or auth tokens changed, update them
+		if string(contactURNs[0].Display) != display || contactURNs[0].ChannelID != channel.ID() || (authTokens != nil && !utils.MapContains(contactURNs[0].AuthTokens, authTokens)) {
 			contactURNs[0].Display = null.String(display)
-			contactURNs[0].ChannelID = channelID
-			if auth != "" {
-				contactURNs[0].Auth = null.String(auth)
+
+			if channel.HasRole(courier.ChannelRoleSend) {
+				contactURNs[0].ChannelID = channel.ID()
 			}
+
+			utils.MapUpdate(contactURNs[0].AuthTokens, authTokens)
+
 			return updateContactURN(db, contactURNs[0])
 		}
 		return nil
@@ -137,16 +135,18 @@ func setDefaultURN(db *sqlx.Tx, channelID courier.ChannelID, contact *DBContact,
 		// if this is current URN, make sure it has an updated auth as well
 		if existing.Identity == string(urn.Identity()) {
 			existing.Priority = topPriority
-			existing.ChannelID = channelID
-			if auth != "" {
-				existing.Auth = null.String(auth)
+
+			if channel.HasRole(courier.ChannelRoleSend) {
+				existing.ChannelID = channel.ID()
 			}
+
+			utils.MapUpdate(contactURNs[0].AuthTokens, authTokens)
 		} else {
 			existing.Priority = currPriority
 
 			// if this is a phone number and we just received a message on a tel scheme, set that as our new preferred channel
-			if existing.Scheme == urns.TelScheme && scheme == urns.TelScheme {
-				existing.ChannelID = channelID
+			if existing.Scheme == urns.TelScheme && scheme == urns.TelScheme && channel.HasRole(courier.ChannelRoleSend) {
+				existing.ChannelID = channel.ID()
 			}
 			currPriority--
 		}
@@ -159,78 +159,70 @@ func setDefaultURN(db *sqlx.Tx, channelID courier.ChannelID, contact *DBContact,
 	return nil
 }
 
-const selectOrgURN = `
-SELECT 
-	org_id, 
-	id, 
-	identity, 
-	scheme, 
-	path, 
-	display, 
-	auth, 
-	priority, 
-	channel_id, 
-	contact_id 
-FROM 
-	contacts_contacturn
-WHERE 
-	org_id = $1 AND 
-	identity = $2
-ORDER BY 
-	priority desc 
-LIMIT 1
-`
-
-// contactURNForURN returns the ContactURN for the passed in org and URN, creating and associating
-// it with the passed in contact if necessary
-func contactURNForURN(db *sqlx.Tx, org OrgID, channelID courier.ChannelID, contactID ContactID, urn urns.URN, auth string) (*DBContactURN, error) {
-	contactURN := newDBContactURN(org, channelID, contactID, urn, auth)
-	err := db.Get(contactURN, selectOrgURN, org, urn.Identity())
-	if err != nil && err != sql.ErrNoRows {
+// getContactURNByIdentity returns the ContactURN for the passed in org and identity
+func getContactURNByIdentity(db *sqlx.Tx, org OrgID, urn urns.URN) (*ContactURN, error) {
+	contactURN := newContactURN(org, courier.NilChannelID, NilContactID, urn, map[string]string{})
+	err := db.Get(contactURN, sqlSelectURNByIdentity, org, urn.Identity())
+	if err != nil {
 		return nil, err
+	}
+	return contactURN, nil
+}
+
+// getOrCreateContactURN returns the ContactURN for the passed in org and URN, creating and associating
+// it with the passed in contact if necessary
+func getOrCreateContactURN(db *sqlx.Tx, channel *Channel, contactID ContactID, urn urns.URN, authTokens map[string]string) (*ContactURN, error) {
+	contactURN := newContactURN(channel.OrgID(), courier.NilChannelID, contactID, urn, authTokens)
+	if channel.HasRole(courier.ChannelRoleSend) {
+		contactURN.ChannelID = channel.ID()
+	}
+	err := db.Get(contactURN, sqlSelectURNByIdentity, channel.OrgID(), urn.Identity())
+	if err != nil && err != sql.ErrNoRows {
+		return nil, errors.Wrap(err, "error looking up URN by identity")
 	}
 
 	// we didn't find it, let's insert it
 	if err == sql.ErrNoRows {
 		err = insertContactURN(db, contactURN)
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "error inserting URN")
 		}
 	}
 
 	display := null.String(urn.Display())
 
 	// make sure our contact URN is up to date
-	if contactURN.ChannelID != channelID || contactURN.ContactID != contactID || contactURN.Display != display {
+	if (channel.HasRole(courier.ChannelRoleSend) && contactURN.ChannelID != channel.ID()) || contactURN.ContactID != contactID || contactURN.Display != display {
 		contactURN.PrevContactID = contactURN.ContactID
-		contactURN.ChannelID = channelID
+		if channel.HasRole(courier.ChannelRoleSend) {
+			contactURN.ChannelID = channel.ID()
+		}
 		contactURN.ContactID = contactID
 		contactURN.Display = display
 		err = updateContactURN(db, contactURN)
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "error updating URN")
 		}
 	}
 
-	// update our auth if we have a value set
-	if auth != "" && auth != string(contactURN.Auth) {
-		contactURN.Auth = null.String(auth)
+	// update our auth tokens if any provided
+	if authTokens != nil {
+		utils.MapUpdate(contactURN.AuthTokens, authTokens)
+
 		err = updateContactURN(db, contactURN)
 	}
 
-	return contactURN, err
+	return contactURN, errors.Wrap(err, "error updating URN auth")
 }
 
-const insertURN = `
-INSERT INTO 
-	contacts_contacturn(org_id, identity, path, scheme, display, auth, priority, channel_id, contact_id)
-                 VALUES(:org_id, :identity, :path, :scheme, :display, :auth, :priority, :channel_id, :contact_id)
-RETURNING id
-`
+const sqlInsertURN = `
+INSERT INTO contacts_contacturn(org_id, identity, path, scheme, display, auth_tokens, priority, channel_id, contact_id)
+                         VALUES(:org_id, :identity, :path, :scheme, :display, :auth_tokens, :priority, :channel_id, :contact_id)
+  RETURNING id`
 
 // InsertContactURN inserts the passed in urn, the id field will be populated with the result on success
-func insertContactURN(db *sqlx.Tx, urn *DBContactURN) error {
-	rows, err := db.NamedQuery(insertURN, urn)
+func insertContactURN(db *sqlx.Tx, urn *ContactURN) error {
+	rows, err := db.NamedQuery(sqlInsertURN, urn)
 	if err != nil {
 		return err
 	}
@@ -242,24 +234,21 @@ func insertContactURN(db *sqlx.Tx, urn *DBContactURN) error {
 	return err
 }
 
-const updateURN = `
-UPDATE 
-	contacts_contacturn
-SET 
-	channel_id = :channel_id, 
-	contact_id = :contact_id, 
-	display = :display, 
-	auth = :auth, 
-	priority = :priority
-WHERE 
-	id = :id
-`
+const sqlUpdateURN = `
+UPDATE contacts_contacturn
+   SET channel_id = :channel_id, contact_id = :contact_id, display = :display, auth_tokens = :auth_tokens, priority = :priority
+ WHERE id = :id`
+
+const sqlFullyUpdateURN = `
+UPDATE contacts_contacturn
+   SET channel_id = :channel_id, contact_id = :contact_id, identity = :identity, path = :path, display = :display, auth_tokens = :auth_tokens, priority = :priority
+ WHERE id = :id`
 
 // UpdateContactURN updates the Channel and Contact on an existing URN
-func updateContactURN(db *sqlx.Tx, urn *DBContactURN) error {
-	rows, err := db.NamedQuery(updateURN, urn)
+func updateContactURN(db *sqlx.Tx, urn *ContactURN) error {
+	rows, err := db.NamedQuery(sqlUpdateURN, urn)
 	if err != nil {
-		logrus.WithError(err).WithField("urn_id", urn.ID).Error("error updating contact urn")
+		slog.Error("error updating contact urn", "error", err, "urn_id", urn.ID)
 		return err
 	}
 	defer rows.Close()
@@ -270,17 +259,17 @@ func updateContactURN(db *sqlx.Tx, urn *DBContactURN) error {
 	return err
 }
 
-// DBContactURN is our struct to map to database level URNs
-type DBContactURN struct {
-	OrgID         OrgID             `db:"org_id"`
-	ID            ContactURNID      `db:"id"`
-	Identity      string            `db:"identity"`
-	Scheme        string            `db:"scheme"`
-	Path          string            `db:"path"`
-	Display       null.String       `db:"display"`
-	Auth          null.String       `db:"auth"`
-	Priority      int               `db:"priority"`
-	ChannelID     courier.ChannelID `db:"channel_id"`
-	ContactID     ContactID         `db:"contact_id"`
-	PrevContactID ContactID
+// FullyUpdateContactURN updates the Identity, Channel and Contact on an existing URN
+func fullyUpdateContactURN(db *sqlx.Tx, urn *ContactURN) error {
+	rows, err := db.NamedQuery(sqlFullyUpdateURN, urn)
+	if err != nil {
+		slog.Error("error updating contact urn", "error", err, "urn_id", urn.ID)
+		return err
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		err = rows.Scan(&urn.ID)
+	}
+	return err
 }

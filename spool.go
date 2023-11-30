@@ -4,14 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
 // FlusherFunc defines our interface for flushers, they are handed a filename and byte blob and are expected
@@ -24,14 +22,14 @@ func RegisterFlusher(directory string, flusherFunc FlusherFunc) {
 }
 
 // WriteToSpool writes the passed in object to the passed in subdir
-func WriteToSpool(spoolDir string, subdir string, contents interface{}) error {
+func WriteToSpool(spoolDir string, subdir string, contents any) error {
 	contentBytes, err := json.MarshalIndent(contents, "", "  ")
 	if err != nil {
 		return err
 	}
 
 	filename := path.Join(spoolDir, subdir, fmt.Sprintf("%d.json", time.Now().UnixNano()))
-	return ioutil.WriteFile(filename, contentBytes, 0640)
+	return os.WriteFile(filename, contentBytes, 0640)
 }
 
 // starts our spool flusher, which every 30 seconds tries to write our pending msgs and statuses
@@ -42,12 +40,13 @@ func startSpoolFlushers(s Server) {
 		flushers[i] = newSpoolFlusher(s, reg.directory, reg.flusher)
 	}
 
+	s.WaitGroup().Add(1)
+
 	go func() {
-		s.WaitGroup().Add(1)
 		defer s.WaitGroup().Done()
 
-		log := logrus.WithField("comp", "spool")
-		log.WithField("state", "started").Info("spool started")
+		log := slog.With("comp", "spool")
+		log.Info("spool started", "state", "started")
 
 		// runs until stopped, checking every 30 seconds if there is anything to flush from our spool
 		for {
@@ -55,7 +54,7 @@ func startSpoolFlushers(s Server) {
 
 			// our server is shutting down, exit
 			case <-s.StopChan():
-				log.WithField("state", "stopped").Info("spool stopped")
+				log.Info("spool stopped", "state", "stopped")
 				return
 
 			// every 30 seconds we check to see if there are any files to spool
@@ -99,18 +98,18 @@ func newSpoolFlusher(s Server, dir string, flusherFunc FlusherFunc) *flusher {
 			return nil
 		}
 
-		log := logrus.WithField("comp", "spool").WithField("filename", filename)
+		log := slog.With("comp", "spool", "filename", filename)
 
 		// otherwise, read our msg json
-		contents, err := ioutil.ReadFile(filename)
+		contents, err := os.ReadFile(filename)
 		if err != nil {
-			log.WithError(err).Error("reading spool file")
+			log.Error("reading spool file", "error", err)
 			return nil
 		}
 
 		err = flusherFunc(filename, contents)
 		if err != nil {
-			log.WithError(err).Error("flushing spool file")
+			log.Error("flushing spool file", "error", err)
 			return err
 		}
 		log.Info("flushed")

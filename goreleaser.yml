@@ -2,14 +2,19 @@ build:
   main: ./cmd/courier/main.go
   binary: courier
   goos:
-    - windows
     - darwin
     - linux
   goarch:
     - amd64
+    - arm64
 
-archive:
-  files:
-    - LICENSE
-    - README.md
-    - courier.toml
+changelog:
+  filters:
+    exclude:
+      - "^Update CHANGELOG.md"
+
+archives:
+  - files:
+      - LICENSE
+      - README.md
+      - courier.toml

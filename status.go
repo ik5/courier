@@ -1,37 +1,39 @@
 package courier
 
-// MsgStatusValue is the status of a message
-type MsgStatusValue string
+import "github.com/nyaruka/gocommon/urns"
+
+// MsgStatus is the status of a message
+type MsgStatus string
 
 // Possible values for MsgStatus
 const (
-	MsgPending   MsgStatusValue = "P"
-	MsgQueued    MsgStatusValue = "Q"
-	MsgSent      MsgStatusValue = "S"
-	MsgWired     MsgStatusValue = "W"
-	MsgErrored   MsgStatusValue = "E"
-	MsgDelivered MsgStatusValue = "D"
-	MsgFailed    MsgStatusValue = "F"
-	NilMsgStatus MsgStatusValue = ""
+	MsgStatusPending   MsgStatus = "P"
+	MsgStatusQueued    MsgStatus = "Q"
+	MsgStatusSent      MsgStatus = "S"
+	MsgStatusWired     MsgStatus = "W"
+	MsgStatusErrored   MsgStatus = "E"
+	MsgStatusDelivered MsgStatus = "D"
+	MsgStatusFailed    MsgStatus = "F"
+	NilMsgStatus       MsgStatus = ""
 )
 
 //-----------------------------------------------------------------------------
-// MsgStatusUpdate Interface
+// StatusUpdate Interface
 //-----------------------------------------------------------------------------
 
-// MsgStatus represents a status update on a message
-type MsgStatus interface {
-	EventID() int64
+// StatusUpdate represents a status update on a message
+type StatusUpdate interface {
+	Event
 
 	ChannelUUID() ChannelUUID
-	ID() MsgID
+	MsgID() MsgID
+
+	SetURNUpdate(old, new urns.URN) error
+	URNUpdate() (old, new urns.URN)
 
 	ExternalID() string
 	SetExternalID(string)
 
-	Status() MsgStatusValue
-	SetStatus(MsgStatusValue)
-
-	Logs() []*ChannelLog
-	AddLog(log *ChannelLog)
+	Status() MsgStatus
+	SetStatus(MsgStatus)
 }

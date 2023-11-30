@@ -2,30 +2,27 @@ package rapidpro
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
-	"net/http"
-	"net/url"
+	"log/slog"
 	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/buger/jsonparser"
-
-	"mime"
-
-	"github.com/garyburd/redigo/redis"
+	"github.com/gomodule/redigo/redis"
 	"github.com/lib/pq"
 	"github.com/nyaruka/courier"
 	"github.com/nyaruka/courier/queue"
-	"github.com/nyaruka/courier/utils"
+	"github.com/nyaruka/gocommon/i18n"
 	"github.com/nyaruka/gocommon/urns"
-	"github.com/nyaruka/null"
-	"github.com/sirupsen/logrus"
+	"github.com/nyaruka/gocommon/uuids"
+	"github.com/nyaruka/null/v3"
+	"github.com/pkg/errors"
 	filetype "gopkg.in/h2non/filetype.v1"
 )
 
@@ -34,9 +31,8 @@ type MsgDirection string
 
 // Possible values for MsgDirection
 const (
-	MsgIncoming     MsgDirection = "I"
-	MsgOutgoing     MsgDirection = "O"
-	NilMsgDirection MsgDirection = ""
+	MsgIncoming MsgDirection = "I"
+	MsgOutgoing MsgDirection = "O"
 )
 
 // MsgVisibility is the visibility of a message
@@ -49,58 +45,75 @@ const (
 	MsgArchived MsgVisibility = "A"
 )
 
-// WriteMsg creates a message given the passed in arguments
-func writeMsg(ctx context.Context, b *backend, msg courier.Msg) error {
-	m := msg.(*DBMsg)
+// Msg is our base struct to represent msgs both in our JSON and db representations
+type Msg struct {
+	OrgID_        OrgID             `json:"org_id"          db:"org_id"`
+	ID_           courier.MsgID     `json:"id"              db:"id"`
+	UUID_         courier.MsgUUID   `json:"uuid"            db:"uuid"`
+	Direction_    MsgDirection      `                       db:"direction"`
+	Status_       courier.MsgStatus `                       db:"status"`
+	Visibility_   MsgVisibility     `                       db:"visibility"`
+	HighPriority_ bool              `json:"high_priority"   db:"high_priority"`
+	Text_         string            `json:"text"            db:"text"`
+	Attachments_  pq.StringArray    `json:"attachments"     db:"attachments"`
+	QuickReplies_ pq.StringArray    `json:"quick_replies"   db:"quick_replies"`
+	Locale_       null.String       `json:"locale"          db:"locale"`
+	ExternalID_   null.String       `                       db:"external_id"`
+	Metadata_     json.RawMessage   `json:"metadata"        db:"metadata"`
 
-	// this msg has already been written (we received it twice), we are a no op
-	if m.alreadyWritten {
-		return nil
-	}
+	ChannelID_    courier.ChannelID `                       db:"channel_id"`
+	ContactID_    ContactID         `json:"contact_id"      db:"contact_id"`
+	ContactURNID_ ContactURNID      `json:"contact_urn_id"  db:"contact_urn_id"`
 
-	channel := m.Channel()
+	MessageCount_ int         `                     db:"msg_count"`
+	ErrorCount_   int         `                     db:"error_count"`
+	FailedReason_ null.String `                     db:"failed_reason"`
 
-	// if we have media, go download it to S3
-	for i, attachment := range m.Attachments_ {
-		if strings.HasPrefix(attachment, "http") {
-			url, err := downloadMediaToS3(ctx, b, channel, m.OrgID_, m.UUID_, attachment)
-			if err != nil {
-				return err
-			}
-			m.Attachments_[i] = url
-		}
-	}
+	NextAttempt_ time.Time      `                     db:"next_attempt"`
+	CreatedOn_   time.Time      `json:"created_on"    db:"created_on"`
+	ModifiedOn_  time.Time      `                     db:"modified_on"`
+	QueuedOn_    time.Time      `                     db:"queued_on"`
+	SentOn_      *time.Time     `                     db:"sent_on"`
+	LogUUIDs     pq.StringArray `                     db:"log_uuids"`
 
-	// try to write it our db
-	err := writeMsgToDB(ctx, b, m)
+	// extra non-model fields that mailroom will include in queued payload
+	ChannelUUID_          courier.ChannelUUID     `json:"channel_uuid"`
+	URN_                  urns.URN                `json:"urn"`
+	URNAuth_              string                  `json:"urn_auth"`
+	ResponseToExternalID_ string                  `json:"response_to_external_id"`
+	IsResend_             bool                    `json:"is_resend"`
+	Flow_                 *courier.FlowReference  `json:"flow"`
+	OptIn_                *courier.OptInReference `json:"optin"`
+	Origin_               courier.MsgOrigin       `json:"origin"`
+	ContactLastSeenOn_    *time.Time              `json:"contact_last_seen_on"`
 
-	// fail? log
-	if err != nil {
-		logrus.WithError(err).WithField("msg", m.UUID().String()).Error("error writing to db")
-	}
+	// extra fields used to allow courier to update a session's timeout to *after* the message has been sent
+	SessionID_            SessionID  `json:"session_id"`
+	SessionTimeout_       int        `json:"session_timeout"`
+	SessionWaitStartedOn_ *time.Time `json:"session_wait_started_on"`
+	SessionStatus_        string     `json:"session_status"`
 
-	// if we failed write to spool
-	if err != nil {
-		err = courier.WriteToSpool(b.config.SpoolDir, "msgs", m)
-	}
-	// mark this msg as having been seen
-	writeMsgSeen(b, m)
-	return err
+	ContactName_   string            `json:"contact_name"`
+	URNAuthTokens_ map[string]string `json:"auth_tokens"`
+	channel        *Channel
+	workerToken    queue.WorkerToken
+	alreadyWritten bool
 }
 
 // newMsg creates a new DBMsg object with the passed in parameters
-func newMsg(direction MsgDirection, channel courier.Channel, urn urns.URN, text string) *DBMsg {
+func newMsg(direction MsgDirection, channel courier.Channel, urn urns.URN, text string, extID string, clog *courier.ChannelLog) *Msg {
 	now := time.Now()
-	dbChannel := channel.(*DBChannel)
+	dbChannel := channel.(*Channel)
 
-	return &DBMsg{
+	return &Msg{
 		OrgID_:        dbChannel.OrgID(),
-		UUID_:         courier.NewMsgUUID(),
+		UUID_:         courier.MsgUUID(uuids.New()),
 		Direction_:    direction,
-		Status_:       courier.MsgPending,
+		Status_:       courier.MsgStatusPending,
 		Visibility_:   MsgVisible,
 		HighPriority_: false,
 		Text_:         text,
+		ExternalID_:   null.String(extID),
 
 		ChannelID_:   dbChannel.ID(),
 		ChannelUUID_: dbChannel.UUID(),
@@ -112,6 +125,7 @@ func newMsg(direction MsgDirection, channel courier.Channel, urn urns.URN, text 
 		CreatedOn_:   now,
 		ModifiedOn_:  now,
 		QueuedOn_:    now,
+		LogUUIDs:     []string{string(clog.UUID())},
 
 		channel:        dbChannel,
 		workerToken:    "",
@@ -119,38 +133,145 @@ func newMsg(direction MsgDirection, channel courier.Channel, urn urns.URN, text 
 	}
 }
 
-const insertMsgSQL = `
-INSERT INTO
-	msgs_msg(org_id, uuid, direction, text, attachments, msg_count, error_count, high_priority, status,
-             visibility, external_id, channel_id, contact_id, contact_urn_id, created_on, modified_on, next_attempt, queued_on, sent_on)
-    VALUES(:org_id, :uuid, :direction, :text, :attachments, :msg_count, :error_count, :high_priority, :status,
-           :visibility, :external_id, :channel_id, :contact_id, :contact_urn_id, :created_on, :modified_on, :next_attempt, :queued_on, :sent_on)
-RETURNING id
-`
+func (m *Msg) EventID() int64           { return int64(m.ID_) }
+func (m *Msg) ID() courier.MsgID        { return m.ID_ }
+func (m *Msg) UUID() courier.MsgUUID    { return m.UUID_ }
+func (m *Msg) ExternalID() string       { return string(m.ExternalID_) }
+func (m *Msg) Text() string             { return m.Text_ }
+func (m *Msg) Attachments() []string    { return m.Attachments_ }
+func (m *Msg) URN() urns.URN            { return m.URN_ }
+func (m *Msg) Channel() courier.Channel { return m.channel }
 
-func writeMsgToDB(ctx context.Context, b *backend, m *DBMsg) error {
-	// grab the contact for this msg
-	contact, err := contactForURN(ctx, b, m.OrgID_, m.channel, m.URN_, m.URNAuth_, m.ContactName_)
+// outgoing specific
+func (m *Msg) QuickReplies() []string        { return m.QuickReplies_ }
+func (m *Msg) Locale() i18n.Locale           { return i18n.Locale(string(m.Locale_)) }
+func (m *Msg) URNAuth() string               { return m.URNAuth_ }
+func (m *Msg) Origin() courier.MsgOrigin     { return m.Origin_ }
+func (m *Msg) ContactLastSeenOn() *time.Time { return m.ContactLastSeenOn_ }
+func (m *Msg) Topic() string {
+	if m.Metadata_ == nil {
+		return ""
+	}
+	topic, _, _, _ := jsonparser.Get(m.Metadata_, "topic")
+	return string(topic)
+}
+func (m *Msg) Metadata() json.RawMessage {
+	return m.Metadata_
+}
+func (m *Msg) ResponseToExternalID() string   { return m.ResponseToExternalID_ }
+func (m *Msg) SentOn() *time.Time             { return m.SentOn_ }
+func (m *Msg) IsResend() bool                 { return m.IsResend_ }
+func (m *Msg) Flow() *courier.FlowReference   { return m.Flow_ }
+func (m *Msg) OptIn() *courier.OptInReference { return m.OptIn_ }
+func (m *Msg) SessionStatus() string          { return m.SessionStatus_ }
+func (m *Msg) HighPriority() bool             { return m.HighPriority_ }
+
+// incoming specific
+func (m *Msg) ReceivedOn() *time.Time { return m.SentOn_ }
+func (m *Msg) WithAttachment(url string) courier.MsgIn {
+	m.Attachments_ = append(m.Attachments_, url)
+	return m
+}
+func (m *Msg) WithContactName(name string) courier.MsgIn { m.ContactName_ = name; return m }
+func (m *Msg) WithURNAuthTokens(tokens map[string]string) courier.MsgIn {
+	m.URNAuthTokens_ = tokens
+	return m
+}
+func (m *Msg) WithReceivedOn(date time.Time) courier.MsgIn { m.SentOn_ = &date; return m }
+
+func (m *Msg) hash() string {
+	hash := sha1.Sum([]byte(m.Text_ + "|" + strings.Join(m.Attachments_, "|")))
+	return hex.EncodeToString(hash[:])
+}
+
+// WriteMsg creates a message given the passed in arguments
+func writeMsg(ctx context.Context, b *backend, msg courier.MsgIn, clog *courier.ChannelLog) error {
+	m := msg.(*Msg)
+
+	// this msg has already been written (we received it twice), we are a no op
+	if m.alreadyWritten {
+		return nil
+	}
+
+	channel := m.Channel()
+
+	// check for data: attachment URLs which need to be fetched now - fetching of other URLs can be deferred until
+	// message handling and performed by calling the /c/_fetch-attachment endpoint
+	for i, attURL := range m.Attachments_ {
+		if strings.HasPrefix(attURL, "data:") {
+			attData, err := base64.StdEncoding.DecodeString(attURL[5:])
+			if err != nil {
+				clog.Error(courier.ErrorAttachmentNotDecodable())
+				return errors.Wrap(err, "unable to decode attachment data")
+			}
+
+			var contentType, extension string
+			fileType, _ := filetype.Match(attData[:300])
+			if fileType != filetype.Unknown {
+				contentType = fileType.MIME.Value
+				extension = fileType.Extension
+			} else {
+				contentType = "application/octet-stream"
+				extension = "bin"
+			}
+
+			newURL, err := b.SaveAttachment(ctx, channel, contentType, attData, extension)
+			if err != nil {
+				return err
+			}
+			m.Attachments_[i] = fmt.Sprintf("%s:%s", contentType, newURL)
+		}
+	}
+
+	// try to write it our db
+	err := writeMsgToDB(ctx, b, m, clog)
+
+	// fail? log
+	if err != nil {
+		slog.Error("error writing to db", "error", err, "msg", m.UUID())
+	}
+
+	// if we failed write to spool
+	if err != nil {
+		err = courier.WriteToSpool(b.config.SpoolDir, "msgs", m)
+	}
+
+	// mark this msg as having been seen
+	b.recordMsgReceived(m)
+
+	return err
+}
+
+const sqlInsertMsg = `
+INSERT INTO
+	msgs_msg(org_id, uuid, direction, text, attachments, msg_type, msg_count, error_count, high_priority, status,
+             visibility, external_id, channel_id, contact_id, contact_urn_id, created_on, modified_on, next_attempt, queued_on, sent_on, log_uuids)
+    VALUES(:org_id, :uuid, :direction, :text, :attachments, 'T', :msg_count, :error_count, :high_priority, :status,
+           :visibility, :external_id, :channel_id, :contact_id, :contact_urn_id, :created_on, :modified_on, :next_attempt, :queued_on, :sent_on, :log_uuids)
+RETURNING id`
+
+func writeMsgToDB(ctx context.Context, b *backend, m *Msg, clog *courier.ChannelLog) error {
+	contact, err := contactForURN(ctx, b, m.OrgID_, m.channel, m.URN_, m.URNAuthTokens_, m.ContactName_, clog)
 
 	// our db is down, write to the spool, we will write/queue this later
 	if err != nil {
-		return err
+		return errors.Wrap(err, "error getting contact for message")
 	}
 
-	// set our contact and urn ids from our contact
+	// set our contact and urn id
 	m.ContactID_ = contact.ID_
 	m.ContactURNID_ = contact.URNID_
 
-	rows, err := b.db.NamedQueryContext(ctx, insertMsgSQL, m)
+	rows, err := b.db.NamedQueryContext(ctx, sqlInsertMsg, m)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "error inserting message")
 	}
 	defer rows.Close()
 
 	rows.Next()
 	err = rows.Scan(&m.ID_)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "error scanning for inserted message id")
 	}
 
 	// queue this up to be handled by RapidPro
@@ -161,140 +282,10 @@ func writeMsgToDB(ctx context.Context, b *backend, m *DBMsg) error {
 	// if we had a problem queueing the handling, log it, but our message is written, it'll
 	// get picked up by our rapidpro catch-all after a period
 	if err != nil {
-		logrus.WithError(err).WithField("msg_id", m.ID_).Error("error queueing msg handling")
+		slog.Error("error queueing msg handling", "error", err, "msg_id", m.ID_)
 	}
 
 	return nil
-}
-
-const selectMsgSQL = `
-SELECT
-	org_id,
-	direction,
-	text,
-	attachments,
-	msg_count,
-	error_count,
-	high_priority,
-	status,
-	visibility,
-	external_id,
-	channel_id,
-	contact_id,
-	contact_urn_id,
-	created_on,
-	modified_on,
-	next_attempt,
-	queued_on,
-	sent_on
-FROM
-	msgs_msg
-WHERE
-	id = $1
-`
-
-// for testing only, returned DBMsg object is not fully populated
-func readMsgFromDB(b *backend, id courier.MsgID) (*DBMsg, error) {
-	m := &DBMsg{
-		ID_: id,
-	}
-	err := b.db.Get(m, selectMsgSQL, id)
-	return m, err
-}
-
-//-----------------------------------------------------------------------------
-// Media download and classification
-//-----------------------------------------------------------------------------
-
-func downloadMediaToS3(ctx context.Context, b *backend, channel courier.Channel, orgID OrgID, msgUUID courier.MsgUUID, mediaURL string) (string, error) {
-
-	parsedURL, err := url.Parse(mediaURL)
-	if err != nil {
-		return "", err
-	}
-
-	var req *http.Request
-	handler := courier.GetHandler(channel.ChannelType())
-	if handler != nil {
-		builder, isBuilder := handler.(courier.MediaDownloadRequestBuilder)
-		if isBuilder {
-			req, err = builder.BuildDownloadMediaRequest(ctx, b, channel, parsedURL.String())
-
-			// in the case of errors, we log the error but move onwards anyways
-			if err != nil {
-				logrus.WithField("channel_uuid", channel.UUID()).WithField("channel_type", channel.ChannelType()).WithField("media_url", mediaURL).WithError(err).Error("unable to build media download request")
-			}
-		}
-	}
-
-	if req == nil {
-		// first fetch our media
-		req, err = http.NewRequest(http.MethodGet, mediaURL, nil)
-		if err != nil {
-			return "", err
-		}
-	}
-
-	resp, err := utils.GetHTTPClient().Do(req)
-	if err != nil {
-		return "", err
-	}
-	body, err := ioutil.ReadAll(resp.Body)
-	defer resp.Body.Close()
-	if err != nil {
-		return "", err
-	}
-
-	mimeType := ""
-	extension := filepath.Ext(parsedURL.Path)
-	if extension != "" {
-		extension = extension[1:]
-	}
-
-	// first try getting our mime type from the first 300 bytes of our body
-	fileType, err := filetype.Match(body[:300])
-	if fileType != filetype.Unknown {
-		mimeType = fileType.MIME.Value
-		extension = fileType.Extension
-	} else {
-		// if that didn't work, try from our extension
-		fileType = filetype.GetType(extension)
-		if fileType != filetype.Unknown {
-			mimeType = fileType.MIME.Value
-			extension = fileType.Extension
-		}
-	}
-
-	// we still don't know our mime type, use our content header instead
-	if mimeType == "" {
-		mimeType, _, _ = mime.ParseMediaType(resp.Header.Get("Content-Type"))
-		if extension == "" {
-			extensions, err := mime.ExtensionsByType(mimeType)
-			if extensions == nil || err != nil {
-				extension = ""
-			} else {
-				extension = extensions[0][1:]
-			}
-		}
-	}
-
-	// create our filename
-	filename := msgUUID.String()
-	if extension != "" {
-		filename = fmt.Sprintf("%s.%s", msgUUID, extension)
-	}
-	path := filepath.Join(b.config.S3MediaPrefix, strconv.FormatInt(int64(orgID), 10), filename[:4], filename[4:8], filename)
-	if !strings.HasPrefix(path, "/") {
-		path = fmt.Sprintf("/%s", path)
-	}
-
-	s3URL, err := utils.PutS3File(b.s3Client, b.config.S3MediaBucket, path, mimeType, body)
-	if err != nil {
-		return "", err
-	}
-
-	// return our new media URL, which is prefixed by our content type
-	return fmt.Sprintf("%s:%s", mimeType, s3URL), nil
 }
 
 //-----------------------------------------------------------------------------
@@ -305,7 +296,7 @@ func (b *backend) flushMsgFile(filename string, contents []byte) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
 	defer cancel()
 
-	msg := &DBMsg{}
+	msg := &Msg{}
 	err := json.Unmarshal(contents, msg)
 	if err != nil {
 		log.Printf("ERROR unmarshalling spool file '%s', renaming: %s\n", filename, err)
@@ -318,10 +309,13 @@ func (b *backend) flushMsgFile(filename string, contents []byte) error {
 	if err != nil {
 		return err
 	}
-	msg.channel = channel.(*DBChannel)
+	msg.channel = channel.(*Channel)
+
+	// create log tho it won't be written
+	clog := courier.NewChannelLog(courier.ChannelLogTypeMsgReceive, channel, nil)
 
 	// try to write it our db
-	err = writeMsgToDB(ctx, b, msg)
+	err = writeMsgToDB(ctx, b, msg, clog)
 
 	// fail? oh well, we'll try again later
 	return err
@@ -331,258 +325,55 @@ func (b *backend) flushMsgFile(filename string, contents []byte) error {
 // Deduping utility methods
 //-----------------------------------------------------------------------------
 
-var luaMsgSeen = redis.NewScript(3, `-- KEYS: [Window, PrevWindow, URNFingerprint]
-	-- try to look up in window
-	local found = redis.call("hget", KEYS[1], KEYS[3])
+// checks to see if this message has already been received and if so returns its UUID
+func (b *backend) checkMsgAlreadyReceived(msg *Msg) courier.MsgUUID {
+	rc := b.redisPool.Get()
+	defer rc.Close()
 
-	-- didn't find it, try in our previous window
-	if not found then
-		found = redis.call("hget", KEYS[2], KEYS[3])
-	end
+	// if we have an external id use that
+	if msg.ExternalID_ != "" {
+		fingerprint := fmt.Sprintf("%s|%s|%s", msg.Channel().UUID(), msg.URN().Identity(), msg.ExternalID())
 
-	-- return the fingerprint found
-	return found
-`)
+		if uuid, _ := b.receivedExternalIDs.Get(rc, fingerprint); uuid != "" {
+			return courier.MsgUUID(uuid)
+		}
+	} else {
+		// otherwise de-dup based on text received from that channel+urn since last send
+		fingerprint := fmt.Sprintf("%s|%s", msg.Channel().UUID(), msg.URN().Identity())
 
-// checkMsgSeen tries to look up whether a msg with the fingerprint passed in was seen in window or prevWindow. If
-// found returns the UUID of that msg, if not returns empty string
-func checkMsgSeen(b *backend, msg *DBMsg) courier.MsgUUID {
-	r := b.redisPool.Get()
-	defer r.Close()
+		if uuidAndHash, _ := b.receivedMsgs.Get(rc, fingerprint); uuidAndHash != "" {
+			prevUUID := uuidAndHash[:36]
+			prevHash := uuidAndHash[37:]
 
-	urnFingerprint := msg.urnFingerprint()
-
-	now := time.Now().In(time.UTC)
-	prev := now.Add(time.Second * -2)
-	windowKey := fmt.Sprintf("seen:msgs:%s:%02d", now.Format("2006-01-02-15:04"), now.Second()/2*2)
-	prevWindowKey := fmt.Sprintf("seen:msgs:%s:%02d", prev.Format("2006-01-02-15:04"), prev.Second()/2*2)
-
-	// see if there were any messages received in the past 4 seconds
-	found, _ := redis.String(luaMsgSeen.Do(r, windowKey, prevWindowKey, urnFingerprint))
-
-	// if so, test whether the text it the same
-	if found != "" {
-		prevText := found[37:]
-
-		// if it is the same, return the UUID
-		if prevText == msg.Text() {
-			return courier.NewMsgUUIDFromString(found[:36])
+			// if it is the same hash, return the UUID
+			if prevHash == msg.hash() {
+				return courier.MsgUUID(prevUUID)
+			}
 		}
 	}
+
 	return courier.NilMsgUUID
 }
 
-var luaWriteMsgSeen = redis.NewScript(3, `-- KEYS: [Window, URNFingerprint, UUIDText]
-	redis.call("hset", KEYS[1], KEYS[2], KEYS[3])
-	redis.call("expire", KEYS[1], 5)
-`)
+// records that the given message has been received and written to the database
+func (b *backend) recordMsgReceived(msg *Msg) {
+	rc := b.redisPool.Get()
+	defer rc.Close()
 
-// writeMsgSeen writes that the message with the passed in fingerprint and UUID was seen in the
-// passed in window
-func writeMsgSeen(b *backend, msg *DBMsg) {
-	r := b.redisPool.Get()
-	defer r.Close()
+	if msg.ExternalID_ != "" {
+		fingerprint := fmt.Sprintf("%s|%s|%s", msg.Channel().UUID(), msg.URN().Identity(), msg.ExternalID())
 
-	urnFingerprint := msg.urnFingerprint()
-	uuidText := fmt.Sprintf("%s|%s", msg.UUID().String(), msg.Text_)
-	now := time.Now().In(time.UTC)
-	windowKey := fmt.Sprintf("seen:msgs:%s:%02d", now.Format("2006-01-02-15:04"), now.Second()/2*2)
+		b.receivedExternalIDs.Set(rc, fingerprint, string(msg.UUID()))
+	} else {
+		fingerprint := fmt.Sprintf("%s|%s", msg.Channel().UUID(), msg.URN().Identity())
 
-	luaWriteMsgSeen.Do(r, windowKey, urnFingerprint, uuidText)
+		b.receivedMsgs.Set(rc, fingerprint, fmt.Sprintf("%s|%s", msg.UUID(), msg.hash()))
+	}
 }
 
 // clearMsgSeen clears our seen incoming messages for the passed in channel and URN
-func clearMsgSeen(rc redis.Conn, msg *DBMsg) {
-	urnFingerprint := msg.urnFingerprint()
+func (b *backend) clearMsgSeen(rc redis.Conn, msg *Msg) {
+	fingerprint := fmt.Sprintf("%s|%s", msg.Channel().UUID(), msg.URN().Identity())
 
-	now := time.Now().In(time.UTC)
-	prev := now.Add(time.Second * -2)
-	windowKey := fmt.Sprintf("seen:msgs:%s:%02d", now.Format("2006-01-02-15:04"), now.Second()/2*2)
-	prevWindowKey := fmt.Sprintf("seen:msgs:%s:%02d", prev.Format("2006-01-02-15:04"), prev.Second()/2*2)
-
-	rc.Send("hdel", windowKey, urnFingerprint)
-	rc.Do("hdel", prevWindowKey, urnFingerprint)
-}
-
-var luaExternalIDSeen = redis.NewScript(3, `-- KEYS: [Window, PrevWindow, ExternalID]
-	-- try to look up in window
-	local found = redis.call("hget", KEYS[1], KEYS[3])
-
-	-- didn't find it, try in our previous window
-	if not found then
-		found = redis.call("hget", KEYS[2], KEYS[3])
-	end
-
-	-- return the fingerprint found
-	return found
-`)
-
-func checkExternalIDSeen(b *backend, msg courier.Msg) courier.MsgUUID {
-	r := b.redisPool.Get()
-	defer r.Close()
-
-	urnFingerprint := fmt.Sprintf("%s:%s|%s", msg.Channel().UUID(), msg.URN().Identity(), msg.ExternalID())
-
-	now := time.Now().In(time.UTC)
-	prev := now.Add(time.Hour * -24)
-	windowKey := fmt.Sprintf("seen:externalid:%s", now.Format("2006-01-02"))
-	prevWindowKey := fmt.Sprintf("seen:externalid:%s", prev.Format("2006-01-02"))
-
-	// see if there were any messages received in the past 24 hours
-	found, _ := redis.String(luaExternalIDSeen.Do(r, windowKey, prevWindowKey, urnFingerprint))
-
-	// if so, test whether the text it the same
-	if found != "" {
-		prevText := found[37:]
-
-		// if it is the same, return the UUID
-		if prevText == msg.Text() {
-			return courier.NewMsgUUIDFromString(found[:36])
-		}
-	}
-	return courier.NilMsgUUID
-}
-
-var luaWriteExternalIDSeen = redis.NewScript(3, `-- KEYS: [Window, ExternalID, Seen]
-	redis.call("hset", KEYS[1], KEYS[2], KEYS[3])
-	redis.call("expire", KEYS[1], 86400)
-`)
-
-func writeExternalIDSeen(b *backend, msg courier.Msg) {
-	r := b.redisPool.Get()
-	defer r.Close()
-
-	urnFingerprint := fmt.Sprintf("%s:%s|%s", msg.Channel().UUID(), msg.URN().Identity(), msg.ExternalID())
-	uuidText := fmt.Sprintf("%s|%s", msg.UUID().String(), msg.Text())
-
-	now := time.Now().In(time.UTC)
-	windowKey := fmt.Sprintf("seen:externalid:%s", now.Format("2006-01-02"))
-
-	luaWriteExternalIDSeen.Do(r, windowKey, urnFingerprint, uuidText)
-}
-
-//-----------------------------------------------------------------------------
-// Our implementation of Msg interface
-//-----------------------------------------------------------------------------
-
-// DBMsg is our base struct to represent msgs both in our JSON and db representations
-type DBMsg struct {
-	OrgID_                OrgID                  `json:"org_id"          db:"org_id"`
-	ID_                   courier.MsgID          `json:"id"              db:"id"`
-	UUID_                 courier.MsgUUID        `json:"uuid"            db:"uuid"`
-	Direction_            MsgDirection           `json:"direction"       db:"direction"`
-	Status_               courier.MsgStatusValue `json:"status"          db:"status"`
-	Visibility_           MsgVisibility          `json:"visibility"      db:"visibility"`
-	HighPriority_         bool                   `json:"high_priority"   db:"high_priority"`
-	URN_                  urns.URN               `json:"urn"`
-	URNAuth_              string                 `json:"urn_auth"`
-	Text_                 string                 `json:"text"            db:"text"`
-	Attachments_          pq.StringArray         `json:"attachments"     db:"attachments"`
-	ExternalID_           null.String            `json:"external_id"     db:"external_id"`
-	ResponseToID_         courier.MsgID          `json:"response_to_id"  db:"response_to_id"`
-	ResponseToExternalID_ string                 `json:"response_to_external_id"`
-	Metadata_             json.RawMessage        `json:"metadata"        db:"metadata"`
-
-	ChannelID_    courier.ChannelID `json:"channel_id"      db:"channel_id"`
-	ContactID_    ContactID         `json:"contact_id"      db:"contact_id"`
-	ContactURNID_ ContactURNID      `json:"contact_urn_id"  db:"contact_urn_id"`
-
-	MessageCount_ int `json:"msg_count"    db:"msg_count"`
-	ErrorCount_   int `json:"error_count"  db:"error_count"`
-
-	ChannelUUID_ courier.ChannelUUID `json:"channel_uuid"`
-	ContactName_ string              `json:"contact_name"`
-
-	NextAttempt_ time.Time `json:"next_attempt"  db:"next_attempt"`
-	CreatedOn_   time.Time `json:"created_on"    db:"created_on"`
-	ModifiedOn_  time.Time `json:"modified_on"   db:"modified_on"`
-	QueuedOn_    time.Time `json:"queued_on"     db:"queued_on"`
-	SentOn_      time.Time `json:"sent_on"       db:"sent_on"`
-
-	// fields used only for mailroom enabled orgs.. these allow courier to update a session's timeout when
-	// a message is sent for correct and efficient timeout behavior
-	SessionID_            SessionID  `json:"session_id,omitempty"`
-	SessionTimeout_       int        `json:"session_timeout,omitempty"`
-	SessionWaitStartedOn_ *time.Time `json:"session_wait_started_on,omitempty"`
-
-	channel        *DBChannel
-	workerToken    queue.WorkerToken
-	alreadyWritten bool
-	quickReplies   []string
-}
-
-func (m *DBMsg) ID() courier.MsgID            { return m.ID_ }
-func (m *DBMsg) EventID() int64               { return int64(m.ID_) }
-func (m *DBMsg) UUID() courier.MsgUUID        { return m.UUID_ }
-func (m *DBMsg) Text() string                 { return m.Text_ }
-func (m *DBMsg) Attachments() []string        { return []string(m.Attachments_) }
-func (m *DBMsg) ExternalID() string           { return string(m.ExternalID_) }
-func (m *DBMsg) URN() urns.URN                { return m.URN_ }
-func (m *DBMsg) URNAuth() string              { return m.URNAuth_ }
-func (m *DBMsg) ContactName() string          { return m.ContactName_ }
-func (m *DBMsg) HighPriority() bool           { return m.HighPriority_ }
-func (m *DBMsg) ReceivedOn() *time.Time       { return &m.SentOn_ }
-func (m *DBMsg) SentOn() *time.Time           { return &m.SentOn_ }
-func (m *DBMsg) ResponseToID() courier.MsgID  { return m.ResponseToID_ }
-func (m *DBMsg) ResponseToExternalID() string { return m.ResponseToExternalID_ }
-
-func (m *DBMsg) Channel() courier.Channel { return m.channel }
-
-func (m *DBMsg) QuickReplies() []string {
-	if m.quickReplies != nil {
-		return m.quickReplies
-	}
-
-	if m.Metadata_ == nil {
-		return nil
-	}
-
-	m.quickReplies = []string{}
-	jsonparser.ArrayEach(
-		m.Metadata_,
-		func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
-			m.quickReplies = append(m.quickReplies, string(value))
-		},
-		"quick_replies")
-	return m.quickReplies
-}
-
-// Metadata returns the metadata for this message
-func (m *DBMsg) Metadata() json.RawMessage {
-	return m.Metadata_
-}
-
-// fingerprint returns a fingerprint for this msg, suitable for figuring out if this is a dupe
-func (m *DBMsg) urnFingerprint() string {
-	return fmt.Sprintf("%s:%s", m.ChannelUUID_, m.URN_.Identity())
-}
-
-// WithContactName can be used to set the contact name on a msg
-func (m *DBMsg) WithContactName(name string) courier.Msg { m.ContactName_ = name; return m }
-
-// WithReceivedOn can be used to set sent_on on a msg in a chained call
-func (m *DBMsg) WithReceivedOn(date time.Time) courier.Msg { m.SentOn_ = date; return m }
-
-// WithExternalID can be used to set the external id on a msg in a chained call
-func (m *DBMsg) WithExternalID(id string) courier.Msg { m.ExternalID_ = null.String(id); return m }
-
-// WithID can be used to set the id on a msg in a chained call
-func (m *DBMsg) WithID(id courier.MsgID) courier.Msg { m.ID_ = id; return m }
-
-// WithUUID can be used to set the id on a msg in a chained call
-func (m *DBMsg) WithUUID(uuid courier.MsgUUID) courier.Msg { m.UUID_ = uuid; return m }
-
-// WithMetadata can be used to add metadata to a Msg
-func (m *DBMsg) WithMetadata(metadata json.RawMessage) courier.Msg { m.Metadata_ = metadata; return m }
-
-// WithAttachment can be used to append to the media urls for a message
-func (m *DBMsg) WithAttachment(url string) courier.Msg {
-	m.Attachments_ = append(m.Attachments_, url)
-	return m
-}
-
-// WithURNAuth can be used to add a URN auth setting to a message
-func (m *DBMsg) WithURNAuth(auth string) courier.Msg {
-	m.URNAuth_ = auth
-	return m
+	b.receivedMsgs.Del(rc, fingerprint)
 }

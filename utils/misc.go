@@ -5,14 +5,21 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"regexp"
-	"strings"
+	"net/url"
+	"path"
+	"reflect"
 	"unicode/utf8"
 
-	"github.com/gofrs/uuid"
+	validator "gopkg.in/go-playground/validator.v9"
 )
+
+var (
+	validate = validator.New()
+)
+
+func Validate(obj any) error {
+	return validate.Struct(obj)
+}
 
 // SignHMAC256 encrypts value with HMAC256 by using a private key
 func SignHMAC256(privateKey string, value string) string {
@@ -21,25 +28,6 @@ func SignHMAC256(privateKey string, value string) string {
 
 	signedParams := hex.EncodeToString(hash.Sum(nil))
 	return signedParams
-}
-
-// NewUUID generates a new v4 UUID
-func NewUUID() string {
-	u, err := uuid.NewV4()
-	if err != nil {
-		// if we can't generate a UUID.. we're done
-		panic(fmt.Sprintf("unable to generate UUID: %s", err))
-	}
-	return u.String()
-}
-
-// MapAsJSON serializes the given map as a JSON string
-func MapAsJSON(m map[string]string) []byte {
-	bytes, err := json.Marshal(m)
-	if err != nil {
-		panic(err)
-	}
-	return bytes
 }
 
 // JoinNonEmpty takes a vararg of strings and return the join of all the non-empty strings with a delimiter between them
@@ -85,29 +73,86 @@ func StringArrayContains(s []string, e string) bool {
 	return false
 }
 
-var invalidChars = regexp.MustCompile("([\u0000-\u0008]|[\u000B-\u000C]|[\u000E-\u001F])")
+// BasePathForURL, parse static URL, and return filename + format
+func BasePathForURL(rawURL string) (string, error) {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL, err
+	}
+	return path.Base(parsedURL.Path), nil
+}
 
-// CleanString removes any control characters from the passed in string
-func CleanString(s string) string {
-	cleaned := invalidChars.ReplaceAllString(s, "")
-
-	// check whether this is valid UTF8
-	if !utf8.ValidString(cleaned) || strings.Contains(cleaned, "\x00") {
-		v := make([]rune, 0, len(cleaned))
-		for i, r := range s {
-			if r == utf8.RuneError {
-				_, size := utf8.DecodeRuneInString(s[i:])
-				if size == 1 {
-					continue
-				}
-			}
-
-			if r != 0 {
-				v = append(v, r)
-			}
-		}
-		cleaned = string(v)
+// StringsToRows takes a slice of strings and re-organizes it into rows and columns
+func StringsToRows(strs []string, maxRows, maxRowRunes, paddingRunes int) [][]string {
+	// calculate rune length if it's all one row
+	totalRunes := 0
+	for i := range strs {
+		totalRunes += utf8.RuneCountInString(strs[i]) + paddingRunes*2
 	}
 
-	return cleaned
+	if totalRunes <= maxRowRunes {
+		// if all strings fit on a single row, do that
+		return [][]string{strs}
+	} else if len(strs) <= maxRows {
+		// if each string can be a row, do that
+		rows := make([][]string, len(strs))
+		for i := range strs {
+			rows[i] = []string{strs[i]}
+		}
+		return rows
+	}
+
+	rows := [][]string{{}}
+	curRow := 0
+	rowRunes := 0
+
+	for _, str := range strs {
+		strRunes := utf8.RuneCountInString(str) + paddingRunes*2
+
+		// take a new row if we can't fit this string and the current row isn't empty and we haven't hit the row limit
+		if rowRunes+strRunes > maxRowRunes && len(rows[curRow]) > 0 && len(rows) < maxRows {
+			rows = append(rows, []string{})
+			curRow += 1
+			rowRunes = 0
+		}
+
+		rows[curRow] = append(rows[curRow], str)
+		rowRunes += strRunes
+	}
+	return rows
+}
+
+func ChunkSlice[T any](slice []T, size int) [][]T {
+	chunks := make([][]T, 0, len(slice)/size+1)
+
+	for i := 0; i < len(slice); i += size {
+		end := i + size
+		if end > len(slice) {
+			end = len(slice)
+		}
+		chunks = append(chunks, slice[i:end])
+	}
+	return chunks
+}
+
+// MapContains returns whether m1 contains all the key value pairs in m2
+func MapContains[K comparable, V comparable, M ~map[K]V](m1 M, m2 M) bool {
+	for k, v2 := range m2 {
+		v1, ok := m1[k]
+		if !ok || v1 != v2 {
+			return false
+		}
+	}
+	return true
+}
+
+// MapUpdate updates map m1 to contain the key value pairs in m2 - deleting any pairs in m1 which have zero values in m2.
+func MapUpdate[K comparable, V comparable, M ~map[K]V](m1 M, m2 M) {
+	for k, v := range m2 {
+		if reflect.ValueOf(v).IsZero() {
+			delete(m1, k)
+		} else {
+			m1[k] = v
+		}
+	}
 }
